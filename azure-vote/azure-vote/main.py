@@ -4,6 +4,8 @@ import random
 import redis
 import socket
 import sys
+from azure.keyvault.secrets import SecretClient
+from azure.identity import DefaultAzureCredential
 
 app = Flask(__name__)
 
@@ -28,14 +30,19 @@ else:
 # Redis configurations
 redis_server = os.environ['REDIS']
 
+# Create Azure Keyvault connection. Assuming environment variables are set.
+keyvault_url = os.environ['KEYVAULT_URL']
+secret_name = os.environ['SECRET_NAME']
+
 # Redis Connection
 try:
-    if "REDIS_PWD" in os.environ:
-        r = redis.StrictRedis(host=redis_server,
+    # Create client and retrieve secret
+    client = SecretClient(vault_url=keyvault_url, credential=DefaultAzureCredential())
+    secret = client.get_secret(secret_name)
+    # Connect to Redis
+    r = redis.StrictRedis(host=redis_server,
                         port=6379,
-                        password=os.environ['REDIS_PWD'])
-    else:
-        r = redis.Redis(redis_server)
+                        password=secret.value)
     r.ping()
 except redis.ConnectionError:
     exit('Failed to connect to Redis, terminating.')
