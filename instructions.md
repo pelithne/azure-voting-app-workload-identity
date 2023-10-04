@@ -9,16 +9,16 @@
 
 ````
 export RESOURCE_GROUP="app-rg"
-export LOCATION="westcentralus"
-export SERVICE_ACCOUNT_NAMESPACE="frontend"
+export LOCATION="westeurope"
 export FRONTEND_NAMESPACE="frontend"
 export BACKEND_NAMESPACE="backend"
 export SERVICE_ACCOUNT_NAME="workload-identity-sa"
 export SUBSCRIPTION="$(az account show --query id --output tsv)"
 export USER_ASSIGNED_IDENTITY_NAME="keyvaultreader"
 export FEDERATED_IDENTITY_CREDENTIAL_NAME="keyvaultfederated"
-export KEYVAULT_NAME="<globally unique name>"
-export KEYVAULT_SECRET_NAME="keyvaultsecret"
+export KEYVAULT_NAME="pelithnekv"
+export KEYVAULT_SECRET_NAME="redissecret"
+expoort ACRNAME=<globally unique name>
 ````
 
 
@@ -27,8 +27,15 @@ export KEYVAULT_SECRET_NAME="keyvaultsecret"
 az group create --name $RESOURCE_GROUP --location $LOCATION
 ````
 
-### Enable OIDC issuer
+### Create Container Registry
+
 ````
+ az acr create --resource-group $RESOURCE_GROUP --name $ACRNAME --sku Premium 
+````
+
+### Create cluster with OIDC issuer and calico network policies
+````
+az aks create -g "${RESOURCE_GROUP}" -n myAKSCluster --node-count 1 --enable-oidc-issuer --enable-workload-identity --generate-ssh-keys --network-plugin kubenet --network-policy calico --attach-acr $ACRNAME
 
 ````
 
@@ -49,7 +56,7 @@ The variable should contain the Issuer URL similar to the following example:
  ### Add a secret to the vault
 
  ````
- az keyvault secret set --vault-name "${KEYVAULT_NAME}" --name "${KEYVAULT_SECRET_NAME}" --value 'letmein'
+ az keyvault secret set --vault-name "${KEYVAULT_NAME}" --name "${KEYVAULT_SECRET_NAME}" --value 'redispassword'
  ````
 
 Add the Key Vault URL to the environment variable *KEYVAULT_URL*
@@ -84,15 +91,31 @@ Connec to the cluster
 
 Create service account
 
+The service account should exist in the frontend namespace, because it's the frontend service that will use that service account to get the credentials to connect to the backend service, in the backend namespace.
+
+First create the namespace
+
+````
+cat <<EOF | kubectl apply -f -
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: $FRONTEND_NAMESPACE
+  labels:
+    name: $FRONTEND_NAMESPACE
+EOF
+````
+
+Then create the service account in that namespace
 ````
 cat <<EOF | kubectl apply -f -
 apiVersion: v1
 kind: ServiceAccount
 metadata:
+  namespace: $FRONTEND_NAMESPACE
   annotations:
     azure.workload.identity/client-id: ${USER_ASSIGNED_CLIENT_ID}
   name: ${SERVICE_ACCOUNT_NAME}
-  namespace: ${SERVICE_ACCOUNT_NAMESPACE}
 EOF
 ````
 
@@ -100,7 +123,7 @@ EOF
 ### Establish federated identity credential
 
 ````
-az identity federated-credential create --name ${FEDERATED_IDENTITY_CREDENTIAL_NAME} --identity-name ${USER_ASSIGNED_IDENTITY_NAME} --resource-group ${RESOURCE_GROUP} --issuer ${AKS_OIDC_ISSUER} --subject system:serviceaccount:${SERVICE_ACCOUNT_NAMESPACE}:${SERVICE_ACCOUNT_NAME}
+az identity federated-credential create --name ${FEDERATED_IDENTITY_CREDENTIAL_NAME} --identity-name ${USER_ASSIGNED_IDENTITY_NAME} --resource-group ${RESOURCE_GROUP} --issuer ${AKS_OIDC_ISSUER} --subject system:serviceaccount:${FRONTEND_NAMESPACE}:${SERVICE_ACCOUNT_NAME}
 ````
 
 ### Build the application
@@ -119,6 +142,22 @@ az acr build --image azure-vote:v1 --registry $CONTAINERREGISTRY .
 
 ### Deploy the application
 
+We want to create some separation between the frontend and backend, by deploying them into different namespaces. Later we will add more separation by introducing network policies in the cluster to allow/disallow traffic between specific namespaces.
+
+
+First, create the backend namespace
+
+
+````
+cat <<EOF | kubectl apply -f -
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: backend
+  labels:
+    name: backend
+EOF
+````
 
 cd only neccesery if using yaml files
 ````
@@ -132,6 +171,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: azure-vote-back
+  namespace: $BACKEND_NAMESPACE
 spec:
   replicas: 1
   selector:
@@ -152,12 +192,13 @@ spec:
           name: redis
         env:
         - name: REDIS_PASSWORD
-          value: "letmein"
+          value: "redispassword"
 ---
 apiVersion: v1
 kind: Service
 metadata:
   name: azure-vote-back
+  namespace: $BACKEND_NAMESPACE
 spec:
   ports:
   - port: 6379
@@ -167,6 +208,10 @@ EOF
 ````
 
 
+Then create the frontend
+
+
+
 Frontend
 ````
 cat <<EOF | kubectl apply -f -
@@ -174,6 +219,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: azure-vote-front
+  namespace: $FRONTEND_NAMESPACE
   labels:
     azure.workload.identity/use: "true"
 spec:
@@ -197,7 +243,7 @@ spec:
         "kubernetes.io/os": linux
       containers:
       - name: azure-vote-front
-        image: pelithnepubacr.azurecr.io/azure-vote:v18
+        image: pelithnepubacr.azurecr.io/azure-vote:v19
         ports:
         - containerPort: 80
         resources:
@@ -207,16 +253,17 @@ spec:
             cpu: 500m
         env:
         - name: REDIS
-          value: "azure-vote-back"
+          value: "azure-vote-back.backend"
         - name: KEYVAULT_URL
-          value: "https://pelithnekeys2.vault.azure.net/"
+          value: $KEYVAULT_URL
         - name: SECRET_NAME
-          value: "redissecret"
+          value: $KEYVAULT_SECRET_NAME
 ---
 apiVersion: v1
 kind: Service
 metadata:
   name: azure-vote-front
+  namespace: $FRONTEND_NAMESPACE
 spec:
   type: LoadBalancer
   ports:
@@ -225,4 +272,14 @@ spec:
     app: azure-vote-front
 
 EOF
+````
+
+
+### Network policies
+The cluster is deployed using kubenet CNI, which means we have to use Calico Network Policies. 
+
+````
+
+
+
 ````

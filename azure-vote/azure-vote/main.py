@@ -40,6 +40,8 @@ try:
     client = SecretClient(vault_url=keyvault_url, credential=DefaultAzureCredential())
     secret = client.get_secret(secret_name)
     # Connect to Redis
+    print("Connecting to Redis...", redis_server)
+    print("Using secret...", secret_name)
     r = redis.StrictRedis(host=redis_server,
                         port=6379,
                         password=secret.value)
