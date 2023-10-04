@@ -1,11 +1,16 @@
 ## Deploy app with Workload Identity
 
-* Activate OIDC issuer on AKS cluster
-* Create an Azure Key Vault and secret.
-* Create an Azure Active Directory (Azure AD) workload identity and  Kubernetes service account.
-* Configure the managed identity for token federation.
-* Deploy the workload and verify authentication with the workload identity.
+During this activity you will:
 
+* Create an Azure Container Registry (or use an existing one)
+* Activate OIDC issuer on AKS cluster (or create a new cluster with OIDC activated)
+* Create an Azure Key Vault and secret.
+* Create an Azure Active Directory (Azure AD) managed identity
+* Connect the MI to a Kubernetes service account with token federation
+* Deploy a workload and verify authentication to keyvault with the workload identity
+
+
+First, lets create a few environment variables, for ease of use
 
 ````
 export RESOURCE_GROUP="app-rg"
@@ -23,31 +28,44 @@ expoort ACRNAME=<globally unique name>
 
 
 ### Create reasource group
+
+Skip this step if RG was already created
+
 ````
 az group create --name $RESOURCE_GROUP --location $LOCATION
 ````
 
 ### Create Container Registry
 
+Skip this step if ACR was already created
+
 ````
  az acr create --resource-group $RESOURCE_GROUP --name $ACRNAME --sku Premium 
 ````
 
 ### Create cluster with OIDC issuer and calico network policies
+
+Skip this step if AKS cluster was already created
+
 ````
 az aks create -g "${RESOURCE_GROUP}" -n myAKSCluster --node-count 1 --enable-oidc-issuer --enable-workload-identity --generate-ssh-keys --network-plugin kubenet --network-policy calico --attach-acr $ACRNAME
 
 ````
 
 ### Get the OICD issuer URL
+
+Query the AKS cluster for the OICD issuer URL with the following command, which stores the reult in an environment variable.
+
 ````
 export AKS_OIDC_ISSUER="$(az aks show -n myAKSCluster -g "${RESOURCE_GROUP}" --query "oidcIssuerProfile.issuerUrl" -otsv)"
 ````
 
-The variable should contain the Issuer URL similar to the following example:
- ````https://eastus.oic.prod-aks.azure.com/00000000-0000-0000-0000-000000000000/00000000-0000-0000-0000-000000000000/````
+The variable should contain the Issuer URL similar to the following:
+ ````https://eastus.oic.prod-aks.azure.com/9e08065f-6106-4526-9b01-d6c64753fe02/9a518161-4400-4e57-9913-d8d82344b504/````
 
  ### Create keyvault
+
+Create a keyvault in the same resource group as the other resources (not neccesary for in to be in the same RG, but for clarity)
 
  ````
  az keyvault create --resource-group "${RESOURCE_GROUP}" --location "${LOCATION}" --name "${KEYVAULT_NAME}"
@@ -55,16 +73,20 @@ The variable should contain the Issuer URL similar to the following example:
 
  ### Add a secret to the vault
 
+Create a secret in the keyvault. This is the secret that will be used by the frontend application to connect to the (redis) backend.
+
  ````
  az keyvault secret set --vault-name "${KEYVAULT_NAME}" --name "${KEYVAULT_SECRET_NAME}" --value 'redispassword'
  ````
 
-Add the Key Vault URL to the environment variable *KEYVAULT_URL*
+### Add the Key Vault URL to the environment variable *KEYVAULT_URL*
  ````
  export KEYVAULT_URL="$(az keyvault show -g "${RESOURCE_GROUP}" -n ${KEYVAULT_NAME} --query properties.vaultUri -o tsv)"
  ````
 
  ### Create a managed identity and grant permissions to access the secret
+
+Create a User Managed Identity. We will give this identity *GET access* to the keyvault, and later associate it with a Kubernetes service account. 
 
  ````
  az account set --subscription "${SUBSCRIPTION}"
@@ -72,7 +94,7 @@ Add the Key Vault URL to the environment variable *KEYVAULT_URL*
 
  ````
 
- #### Set an access policy for the managed identity to access the Key Vault
+ Set an access policy for the managed identity to access the Key Vault
 
  ````
  export USER_ASSIGNED_CLIENT_ID="$(az identity show --resource-group "${RESOURCE_GROUP}" --name "${USER_ASSIGNED_IDENTITY_NAME}" --query 'clientId' -otsv)"
@@ -83,15 +105,15 @@ Add the Key Vault URL to the environment variable *KEYVAULT_URL*
 
  ### Create Kubernetes service account
 
-Connec to the cluster
+First, connect to the cluster if not already connected
  
  ````
  az aks get-credentials -n myAKSCluster -g "${RESOURCE_GROUP}"
  ````
 
-Create service account
+#### Create service account
 
-The service account should exist in the frontend namespace, because it's the frontend service that will use that service account to get the credentials to connect to the backend service, in the backend namespace.
+The service account should exist in the frontend namespace, because it's the frontend service that will use that service account to get the credentials to connect to the (redis) backend service.
 
 First create the namespace
 
@@ -106,7 +128,7 @@ metadata:
 EOF
 ````
 
-Then create the service account in that namespace
+Then create a service account in that namespace. Notice the annotation for *workload identity*
 ````
 cat <<EOF | kubectl apply -f -
 apiVersion: v1
@@ -122,14 +144,22 @@ EOF
 
 ### Establish federated identity credential
 
+In this step we connect the service account with the user defined managed identity, using a federated credential.
+
 ````
 az identity federated-credential create --name ${FEDERATED_IDENTITY_CREDENTIAL_NAME} --identity-name ${USER_ASSIGNED_IDENTITY_NAME} --resource-group ${RESOURCE_GROUP} --issuer ${AKS_OIDC_ISSUER} --subject system:serviceaccount:${FRONTEND_NAMESPACE}:${SERVICE_ACCOUNT_NAME}
 ````
 
 ### Build the application
+
+Now its time to build the application. In order to do so, first clone the applications repository:
+
 ````
 git clone git@github.com:pelithne/azure-voting-app-redis.git
 ````
+Then CD into the directory where the (python) application resides and issue the acr build command
+
+#### Note: if the ACR is private, the *acr build* command is not available. Instead the *docker build* command can be used.
 
 ````
 cd azure-voting-app-redis
@@ -208,11 +238,8 @@ EOF
 ````
 
 
-Then create the frontend
+Then create the frontend. In this case we already created the frontend namespace in an earlier step.
 
-
-
-Frontend
 ````
 cat <<EOF | kubectl apply -f -
 apiVersion: apps/v1
